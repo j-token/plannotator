@@ -14,6 +14,7 @@ import {
   handleAnnotateServerReady,
 } from "@plannotator/server/annotate";
 import { getGitContext, runGitDiffWithContext } from "@plannotator/server/git";
+import { parsePRUrl, checkGhAuth, fetchPR } from "@plannotator/server/pr";
 import { resolveMarkdownFile } from "@plannotator/server/resolve-file";
 
 /** Shared dependencies injected by the plugin */
@@ -32,21 +33,59 @@ export async function handleReviewCommand(
 ) {
   const { client, reviewHtmlContent, getSharingEnabled, getShareBaseUrl, directory } = deps;
 
-  client.app.log({ level: "info", message: "Opening code review UI..." });
+  // @ts-ignore - Event properties contain arguments
+  const urlArg: string = event.properties?.arguments || "";
+  const isPRMode = urlArg?.startsWith("http://") || urlArg?.startsWith("https://");
 
-  const gitContext = await getGitContext(directory);
-  const { patch: rawPatch, label: gitRef, error: diffError } = await runGitDiffWithContext(
-    "uncommitted",
-    gitContext
-  );
+  let rawPatch: string;
+  let gitRef: string;
+  let diffError: string | undefined;
+  let gitContext: Awaited<ReturnType<typeof getGitContext>> | undefined;
+  let prMetadata: Awaited<ReturnType<typeof fetchPR>>["metadata"] | undefined;
+
+  if (isPRMode) {
+    client.app.log({ level: "info", message: "Fetching PR for review..." });
+
+    const prRef = parsePRUrl(urlArg);
+    if (!prRef) {
+      client.app.log({ level: "error", message: `Invalid PR URL: ${urlArg}` });
+      return;
+    }
+
+    try {
+      await checkGhAuth();
+    } catch (err) {
+      client.app.log({ level: "error", message: err instanceof Error ? err.message : "GitHub CLI auth check failed" });
+      return;
+    }
+
+    try {
+      const pr = await fetchPR(prRef);
+      rawPatch = pr.rawPatch;
+      gitRef = `PR #${prRef.number}`;
+      prMetadata = pr.metadata;
+    } catch (err) {
+      client.app.log({ level: "error", message: err instanceof Error ? err.message : "Failed to fetch PR" });
+      return;
+    }
+  } else {
+    client.app.log({ level: "info", message: "Opening code review UI..." });
+
+    gitContext = await getGitContext(directory);
+    const diffResult = await runGitDiffWithContext("uncommitted", gitContext);
+    rawPatch = diffResult.patch;
+    gitRef = diffResult.label;
+    diffError = diffResult.error;
+  }
 
   const server = await startReviewServer({
     rawPatch,
     gitRef,
     error: diffError,
     origin: "opencode",
-    diffType: "uncommitted",
+    diffType: isPRMode ? undefined : "uncommitted",
     gitContext,
+    prMetadata,
     sharingEnabled: await getSharingEnabled(),
     shareBaseUrl: getShareBaseUrl(),
     htmlContent: reviewHtmlContent,
@@ -68,7 +107,9 @@ export async function handleReviewCommand(
 
       const message = result.approved
         ? "# Code Review\n\nCode review completed — no changes requested."
-        : `# Code Review Feedback\n\n${result.feedback}\n\nPlease address this feedback.`;
+        : isPRMode
+          ? result.feedback
+          : `# Code Review Feedback\n\n${result.feedback}\n\nPlease address this feedback.`;
 
       try {
         await client.session.prompt({
